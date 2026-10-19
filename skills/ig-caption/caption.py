@@ -12,20 +12,34 @@ scrolling stranger does, then checks the eight things that are worth checking.
 The 125-character cut is an approximation. The real number moves with the
 device, the font size and where your line breaks fall, which is exactly why
 you want a margin rather than a caption engineered to end at 125. Change it
-with --truncate if you want to test a tighter one.
+with --truncate if you want to test a tighter one. It has only been eyeballed
+on English captions, so on Persian treat it as rougher still.
+
+Persian hashtags (#هوش_مصنوعی) are counted against the cap like any other.
+The ONE ASK check knows only English calls to action, so on a Persian caption
+it prints SKIP rather than a warning it cannot back up.
 
 Usage
   python3 caption.py caption.txt
   python3 caption.py caption.txt --keywords "proposal software,client contract"
   pbpaste | python3 caption.py -
   python3 caption.py caption.txt --json
+  python3 caption.py caption.txt --lang fa     # default: auto
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 import textwrap
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ig-human"))
+try:
+    import fa_text  # noqa: E402  the shared Persian text layer, in ig-human
+except ImportError:
+    sys.exit("caption.py needs ig-human/fa_text.py. Install the ig-human skill "
+             "next to ig-caption.")
 
 LIMIT = 2200             # Instagram's hard caption limit.
 TRUNCATE = 125           # Roughly where the feed cuts to "... more".
@@ -35,7 +49,8 @@ HASHTAG_LIMIT = 5        # Instagram's cap per post or reel since 18 Dec 2025,
                          # rather than many generic ones, can improve both your
                          # content's performance and people's experience".
 
-HASHTAG_RE = re.compile(r"(?:^|\s)(#[A-Za-z0-9_]+)")
+# Letters in any script, so a Persian tag is a tag, half-space included.
+HASHTAG_RE = re.compile(r"(?:^|\s)(#[\w" + fa_text.MARKS + fa_text.ZWNJ + r"]+)")
 MENTION_RE = re.compile(r"(?:^|\s)(@[A-Za-z0-9_.]+)")
 LINK_RE = re.compile(r"https?://\S+|\bwww\.\S+|\b[a-z0-9-]+\.(?:com|co|io|net|org|ai|app)/\S*",
                      re.IGNORECASE)
@@ -76,7 +91,8 @@ def render_box(window, truncated, out=sys.stdout, width=52):
     print("  +" + "-" * (width + 2 - len(tail) - 2) + f" {tail} " + "+", file=out)
 
 
-def analyse(text, cut=TRUNCATE, keywords=None):
+def analyse(text, cut=TRUNCATE, keywords=None, lang="auto"):
+    lang = fa_text.resolve_lang(lang, text)
     text = text.rstrip()
     stripped = text.strip()
     chars = len(stripped)
@@ -141,7 +157,12 @@ def analyse(text, cut=TRUNCATE, keywords=None):
         f"{len(links)} link(s) in the caption, and captions are not clickable. "
         f"Move it to the bio or the DM" if links else "no dead links in the body")
 
-    if len(asks) == 1:
+    if lang == "fa":
+        # The ask patterns are English. Counting zero asks in a Persian caption
+        # that has one would be a false warning, so the check sits out.
+        add("ONE ASK", "SKIP", "Persian calls to action are not recognised yet, count them "
+                               "by eye" + (f". English ones found: {', '.join(asks)}" if asks else ""))
+    elif len(asks) == 1:
         add("ONE ASK", "PASS", f"one call to action: {asks[0]}")
     elif not asks:
         add("ONE ASK", "WARN", "no call to action. Decide what this post is for")
@@ -155,10 +176,12 @@ def analyse(text, cut=TRUNCATE, keywords=None):
         + (" - reads as decoration" if density > 4 else ""))
 
     if keywords:
-        low = stripped.lower()
-        found = [k for k in keywords if k.lower() in low]
-        missing = [k for k in keywords if k.lower() not in low]
-        in_window = [k for k in found if k.lower() in window.lower()]
+        # fold() is lower() on English. On Persian it also matches ي to ی and a
+        # half-space to a space, which is how people type the same search term.
+        low = fa_text.fold(stripped)
+        found = [k for k in keywords if fa_text.fold(k) in low]
+        missing = [k for k in keywords if fa_text.fold(k) not in low]
+        in_window = [k for k in found if fa_text.fold(k) in fa_text.fold(window)]
         status = "PASS" if not missing else ("WARN" if found else "FAIL")
         add("SEARCH TERMS", status,
             f"{len(found)}/{len(keywords)} present"
@@ -199,10 +222,15 @@ def main():
                     help=f"characters shown before '... more' (default {TRUNCATE})")
     ap.add_argument("--keywords", default="", help="comma-separated terms you want to be found for")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--lang", default="auto", choices=["auto", "fa", "en"],
+                    help="language of the caption (default: guess from the letters)")
     args = ap.parse_args()
 
-    raw = sys.stdin.read() if args.input == "-" else open(args.input, encoding="utf-8").read()
-    a = analyse(raw, cut=args.truncate, keywords=args.keywords.split(","))
+    fa_text.utf8_stdio()
+    raw = fa_text.read_input(args.input)
+    # Either comma separates terms: "," or the Persian "،".
+    a = analyse(raw, cut=args.truncate, keywords=re.split(r"[,،]", args.keywords),
+                lang=args.lang)
     if args.json:
         print(json.dumps(a, indent=2, ensure_ascii=False))
     else:

@@ -23,24 +23,40 @@ Instagram shows it to. Trust the retention graph over this script.
 
 Each check returns 0 to 100. Higher is better.
 
+On Persian, two checks run: LENGTH and SPECIFICITY (digits, Persian or
+Latin, and English names). STAKES, FRONTLOAD and ADDRESS are built on English
+word lists, so on a Persian hook they print n/a and the score is taken over
+the two that ran. Read a Persian score as a length-and-numbers check, not as
+the full panel. The length window is also the English one: 5 to 12 words at
+about 165 words a minute has not been checked against Persian speech.
+
 Usage
   python3 hookscore.py hooks.txt              # one hook per line, ranked
   python3 hookscore.py --hook "I lost $18,000 on one missing contract."
   pbpaste | python3 hookscore.py -
   python3 hookscore.py hooks.txt --json
+  python3 hookscore.py hooks.txt --lang fa    # default: auto, per hook
 """
 
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
 
-WORD_RE = re.compile(r"[A-Za-z0-9$%'’-]+")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ig-human"))
+try:
+    import fa_text  # noqa: E402  the shared Persian text layer, in ig-human
+except ImportError:
+    sys.exit("hookscore.py needs ig-human/fa_text.py. Install the ig-human skill "
+             "next to ig-reel.")
+
+WORD_RE = fa_text.word_re("$%'’-")
 NUMBER_RE = re.compile(
-    r"\$\s?\d[\d,]*(?:\.\d+)?"                       # money, whole
-    r"|\b\d[\d,]*(?:\.\d+)?\s?"                      # a figure, with or
-    r"(?:%|k\b|x\b|hrs?\b|hours?\b|mins?\b|minutes?\b"  # without a unit
+    r"\$\s?\d[\d,٬]*(?:[.٫]\d+)?"          # money, whole
+    r"|\b\d[\d,٬]*(?:[.٫]\d+)?\s?"         # a figure, with or
+    r"(?:[%٪]|k\b|x\b|hrs?\b|hours?\b|mins?\b|minutes?\b"  # without a unit
     r"|days?\b|weeks?\b|months?\b|years?\b)?",
     re.IGNORECASE)
 PROPER_RE = re.compile(r"(?<!^)\b[A-Z][a-z]{2,}\b")
@@ -115,7 +131,7 @@ def clamp(n):
 
 def words(text):
     # "$18,000" is one word when it is spoken, so it is one word here too.
-    return WORD_RE.findall(re.sub(r"(?<=\d),(?=\d)", "", text))
+    return WORD_RE.findall(fa_text.THOUSANDS_RE.sub("", text))
 
 
 def check_length(text):
@@ -213,7 +229,11 @@ def check_address(text):
 CHECKS = ["LENGTH", "SPECIFICITY", "STAKES", "FRONTLOAD", "ADDRESS"]
 
 
-def run(text):
+NOT_FOR_FA = "not scored on Persian: this check is built on English word lists"
+
+
+def run(text, lang="auto"):
+    lang = fa_text.resolve_lang(lang, text)
     results = {
         "LENGTH": check_length(text),
         "SPECIFICITY": check_specificity(text),
@@ -221,8 +241,15 @@ def run(text):
         "FRONTLOAD": check_frontload(text),
         "ADDRESS": check_address(text),
     }
+    if lang == "fa":
+        # Scoring these on Persian returns a confident wrong number, so they
+        # sit out until there are Persian word lists behind them.
+        for name in ("STAKES", "FRONTLOAD", "ADDRESS"):
+            results[name] = (None, NOT_FOR_FA)
+        score, detail = results["LENGTH"]
+        results["LENGTH"] = (score, detail + ", English speaking rate")
     flags = [msg for pattern, msg in DEALBREAKERS if pattern.search(text)]
-    scores = [results[c][0] for c in CHECKS]
+    scores = [results[c][0] for c in CHECKS if results[c][0] is not None]
     # The weakest property caps the hook, same logic as detect.py: one bad
     # property is enough for the thumb to keep moving.
     overall = statistics.mean(scores) * 0.6 + min(scores) * 0.4 - len(flags) * 15
@@ -232,7 +259,17 @@ def run(text):
     return results, overall, verdict, flags
 
 
+def weakest_check(results):
+    return min((c for c in CHECKS if results[c][0] is not None), key=lambda c: results[c][0])
+
+
+def scored(results):
+    return sum(1 for c in CHECKS if results[c][0] is not None)
+
+
 def bar(score, width=24):
+    if score is None:
+        return " " * width
     filled = round(score / 100 * width)
     return "#" * filled + "." * (width - filled)
 
@@ -243,15 +280,18 @@ def render_one(text, results, overall, verdict, flags, out=sys.stdout):
     print(f"  \"{text.strip()}\"\n", file=out)
     for name in CHECKS:
         score, detail = results[name]
-        print(f"  {name:<13} {bar(score)} {score:5.1f}", file=out)
+        shown = "  n/a" if score is None else f"{score:5.1f}"
+        print(f"  {name:<13} {bar(score)} {shown}", file=out)
         print(f"  {'':<13} {detail}", file=out)
     print("-" * 62, file=out)
     print(f"  {'HOOK SCORE':<13} {bar(overall)} {overall:5.1f}   {verdict}", file=out)
+    if scored(results) < len(CHECKS):
+        print(f"  {'':<13} over {scored(results)} of {len(CHECKS)} checks", file=out)
     for f in flags:
         print(f"\n  DEALBREAKER  {f}", file=out)
     if verdict != "STRONG":
-        weakest = min(CHECKS, key=lambda c: results[c][0])
-        print(f"\n  Weakest property: {weakest}. Fix that one and re-run.", file=out)
+        print(f"\n  Weakest property: {weakest_check(results)}. Fix that one and re-run.",
+              file=out)
     print("", file=out)
 
 
@@ -260,7 +300,8 @@ def render_table(rows, out=sys.stdout):
     for i, r in enumerate(rows, 1):
         mark = "->" if i == 1 else "  "
         hook = r["hook"] if len(r["hook"]) <= 62 else r["hook"][:59] + "..."
-        print(f"{mark} {r['score']:5.1f} {r['verdict']:<7} {hook}", file=out)
+        partial = f"  [{r['scored']} of {len(CHECKS)} checks]" if r["scored"] < len(CHECKS) else ""
+        print(f"{mark} {r['score']:5.1f} {r['verdict']:<7} {hook}{partial}", file=out)
         print(f"        weakest: {r['weakest']} ({r['checks'][r['weakest']]['score']:.0f})", file=out)
         for f in r["flags"]:
             print(f"        dealbreaker: {f}", file=out)
@@ -273,12 +314,15 @@ def main():
     ap.add_argument("input", nargs="?", default="-", help="file with one hook per line, or -")
     ap.add_argument("--hook", help="score a single hook given on the command line")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--lang", default="auto", choices=["auto", "fa", "en"],
+                    help="language of the hooks (default: guess, per hook)")
     args = ap.parse_args()
 
+    fa_text.utf8_stdio()
     if args.hook:
         lines = [args.hook]
     else:
-        raw = sys.stdin.read() if args.input == "-" else open(args.input, encoding="utf-8").read()
+        raw = fa_text.read_input(args.input)
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
     if not lines:
         print("nothing to score", file=sys.stderr)
@@ -286,11 +330,13 @@ def main():
 
     payload = []
     for line in lines:
-        results, overall, verdict, flags = run(line)
+        results, overall, verdict, flags = run(line, args.lang)
         payload.append({
             "hook": line,
-            "checks": {k: {"score": round(v[0], 1), "detail": v[1]} for k, v in results.items()},
-            "weakest": min(CHECKS, key=lambda c: results[c][0]),
+            "checks": {k: {"score": None if v[0] is None else round(v[0], 1), "detail": v[1]}
+                       for k, v in results.items()},
+            "weakest": weakest_check(results),
+            "scored": scored(results),
             "flags": flags,
             "score": round(overall, 1),
             "verdict": verdict,
@@ -301,7 +347,7 @@ def main():
         return
 
     if len(payload) == 1:
-        results, overall, verdict, flags = run(lines[0])
+        results, overall, verdict, flags = run(lines[0], args.lang)
         render_one(lines[0], results, overall, verdict, flags)
     else:
         render_table(sorted(payload, key=lambda r: -r["score"]))

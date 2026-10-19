@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "note": "Lexicon used by humanize.py and detect.py. Replacements are plain-English and keep the sentence grammatical. The last block of each list is Instagram-specific: caption and voiceover slop that does not show up on other platforms. Edit freely - it is meant to be yours.",
+  "note": "Lexicon used by humanize.py and detect.py. Replacements are plain-English and keep the sentence grammatical. The last block of each list is Instagram-specific: caption and voiceover slop that does not show up on other platforms. Edit freely - it is meant to be yours. An invisible entry with action 'stray' is deleted only where it is not doing the job its 'keep' field names.",
   "invisible": [
     {
       "cp": "U+200B",
@@ -10,12 +10,14 @@
     {
       "cp": "U+200C",
       "name": "ZERO WIDTH NON-JOINER",
-      "action": "delete"
+      "action": "stray",
+      "keep": "between two Persian letters, where it is the half-space (نیم‌فاصله) and part of the spelling"
     },
     {
       "cp": "U+200D",
       "name": "ZERO WIDTH JOINER",
-      "action": "delete"
+      "action": "stray",
+      "keep": "between two emoji, where it builds one emoji out of two"
     },
     {
       "cp": "U+2060",
@@ -40,17 +42,20 @@
     {
       "cp": "U+061C",
       "name": "ARABIC LETTER MARK",
-      "action": "delete"
+      "action": "stray",
+      "keep": "in Persian text, where it sets the direction of mixed Persian and English"
     },
     {
       "cp": "U+200E",
       "name": "LEFT-TO-RIGHT MARK",
-      "action": "delete"
+      "action": "stray",
+      "keep": "in Persian text, where it sets the direction of mixed Persian and English"
     },
     {
       "cp": "U+200F",
       "name": "RIGHT-TO-LEFT MARK",
-      "action": "delete"
+      "action": "stray",
+      "keep": "in Persian text, where it sets the direction of mixed Persian and English"
     },
     {
       "cp": "U+E0000-U+E007F",

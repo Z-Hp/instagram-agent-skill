@@ -23,6 +23,10 @@ Usage
   python3 swipe.py captured.tsv
   python3 swipe.py captured.tsv --out ~/.claude/instagram/swipe.md
   python3 swipe.py captured.tsv --json
+
+Persian hooks are counted and scored, but the formula names in hooks.json
+are matched with English patterns, so a Persian hook comes back unclassified
+until those patterns have Persian versions.
 """
 
 import argparse
@@ -34,7 +38,13 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOKS = os.path.join(HERE, "..", "ig-reel", "hooks.json")
-WORD_RE = re.compile(r"[A-Za-z0-9$%'’-]+")
+sys.path.insert(0, os.path.join(HERE, "..", "ig-human"))
+try:
+    import fa_text  # noqa: E402  the shared Persian text layer, in ig-human
+except ImportError:
+    sys.exit("swipe.py needs ig-human/fa_text.py. Install the ig-human skill "
+             "next to ig-viral.")
+WORD_RE = fa_text.word_re("$%'’-")
 
 try:                                              # optional: score the hooks too
     sys.path.insert(0, os.path.join(HERE, "..", "ig-reel"))
@@ -64,7 +74,7 @@ def classify(hook, formulas):
 
 
 def read_rows(path):
-    raw = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
+    raw = fa_text.read_input(path)
     lines = [l for l in raw.splitlines() if l.strip() and not l.lstrip().startswith("#")]
     if not lines:
         return []
@@ -179,6 +189,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    fa_text.utf8_stdio()
     rows = read_rows(args.input)
     if not rows:
         print("no usable rows. Need a tab-separated file with at least views and hook.",

@@ -13,21 +13,35 @@ are close enough to plan an edit and not a substitute for recording it. Set
 your own rate with --wpm once you have timed yourself reading a script out
 loud: most people land between 150 and 200, and the default here is 165.
 
+That range and that default are English. Nobody has timed Persian speech for
+this script yet, so on a Persian script the default rate is a placeholder and
+the report says so. Time yourself once and pass --wpm.
+
 Usage
   python3 beats.py script.txt
   python3 beats.py script.txt --target 30
   python3 beats.py script.txt --wpm 185 --target 45
   pbpaste | python3 beats.py -
   python3 beats.py script.txt --json
+  python3 beats.py script.txt --lang fa       # default: auto
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 
-WORD_RE = re.compile(r"[A-Za-z0-9$%'’-]+")
-SENT_RE = re.compile(r"[^.!?]+[.!?]*")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ig-human"))
+try:
+    import fa_text  # noqa: E402  the shared Persian text layer, in ig-human
+except ImportError:
+    sys.exit("beats.py needs ig-human/fa_text.py. Install the ig-human skill "
+             "next to ig-reel.")
+
+DEFAULT_WPM = 165
+WORD_RE = fa_text.word_re("$%'’-")
+SENT_RE = fa_text.SENT_RE_KEEP_LINES
 CONCRETE_RE = re.compile(r"\$\s?\d|\b\d[\d,.]*\b|(?<!^)\b[A-Z][a-z]{2,}\b", re.MULTILINE)
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "for",
@@ -35,7 +49,7 @@ STOPWORDS = {
     "you", "your", "i", "my", "me", "we", "our", "they", "them", "he", "she",
     "so", "just", "not", "no", "do", "did", "does", "have", "has", "had",
     "will", "can", "at", "as", "by", "from", "out", "up", "off", "one", "all",
-}
+} | fa_text.FA_STOPWORDS
 
 HOOK_WINDOW = 3.0        # seconds. Past this, the thumb has already decided.
 MAX_BEAT = 4.0           # seconds on one idea with no change on screen.
@@ -44,7 +58,7 @@ ABSTRACT_RUN = 3         # beats in a row with nothing checkable in them.
 
 def words(text):
     # "$18,000" is one word when it is spoken, so it is one word here too.
-    return WORD_RE.findall(re.sub(r"(?<=\d),(?=\d)", "", text))
+    return WORD_RE.findall(fa_text.THOUSANDS_RE.sub("", text))
 
 
 def pretty(token):
@@ -82,7 +96,10 @@ def split_beats(raw, wps):
     return beats
 
 
-def analyse(raw, wpm=165, target=None):
+def analyse(raw, wpm=None, target=None, lang="auto"):
+    lang = fa_text.resolve_lang(lang, raw)
+    rate_given = bool(wpm)
+    wpm = wpm or DEFAULT_WPM
     wps = wpm / 60.0
     beats = split_beats(raw, wps)
     if not beats:
@@ -145,9 +162,10 @@ def analyse(raw, wpm=165, target=None):
         else:
             run, start = 0, None
 
-    # Does the last line hand you back to the first one?
-    first = {w.lower() for w in words(rows[0]["text"]) if w.lower() not in STOPWORDS}
-    last = {w.lower() for w in words(rows[-1]["text"]) if w.lower() not in STOPWORDS}
+    # Does the last line hand you back to the first one? fold() is lower() on
+    # English, and on Persian it also stops "می‌خواهم" and "می خواهم" differing.
+    first = {fa_text.fold(w) for w in words(rows[0]["text"])} - STOPWORDS
+    last = {fa_text.fold(w) for w in words(rows[-1]["text"])} - STOPWORDS
     loop = sorted(pretty(w) for w in first & last)
     if loop:
         notes.append(f"Loops: the last beat repeats \"{', '.join(loop[:3])}\" from the hook. "
@@ -165,6 +183,11 @@ def analyse(raw, wpm=165, target=None):
         else:
             notes.append(f"{-delta:.1f}s under target. Either add {int(-delta * wps)} words "
                          "or shoot it short. Short is usually right.")
+
+    if lang == "fa" and not rate_given:
+        notes.append(f"These timings use {DEFAULT_WPM} wpm, an English speaking rate. "
+                     "Persian has not been timed for this script: read one script out loud "
+                     "against a clock and pass your own rate with --wpm.")
 
     return {
         "wpm": wpm, "target": target,
@@ -194,13 +217,16 @@ def render(a, out=sys.stdout):
 def main():
     ap = argparse.ArgumentParser(description="Time a Reel script into a beat sheet.")
     ap.add_argument("input", nargs="?", default="-", help="script file, or - for stdin")
-    ap.add_argument("--wpm", type=float, default=165, help="speaking rate (default 165)")
+    ap.add_argument("--wpm", type=float, help=f"speaking rate (default {DEFAULT_WPM})")
     ap.add_argument("--target", type=float, help="target length in seconds")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--lang", default="auto", choices=["auto", "fa", "en"],
+                    help="language of the script (default: guess from the letters)")
     args = ap.parse_args()
 
-    raw = sys.stdin.read() if args.input == "-" else open(args.input, encoding="utf-8").read()
-    a = analyse(raw, wpm=args.wpm, target=args.target)
+    fa_text.utf8_stdio()
+    raw = fa_text.read_input(args.input)
+    a = analyse(raw, wpm=args.wpm, target=args.target, lang=args.lang)
     if not a:
         print("empty script", file=sys.stderr)
         sys.exit(2)

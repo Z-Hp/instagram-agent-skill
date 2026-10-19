@@ -14,11 +14,17 @@ numbers too - but the only honest claim is the one on this line.
 
 Each check returns a HUMAN score from 0 to 100. Higher is better.
 
+On Persian two of the five are not scored yet. SLOP DENSITY needs a Persian
+lexicon and VOICE counts English contractions and pronouns, so on Persian
+text they would return a confident wrong number. They print n/a instead, and
+the verdict is taken over the checks that did run.
+
 Usage
   python3 detect.py draft.txt
   pbpaste | python3 detect.py -
   python3 detect.py draft.txt --json
   python3 detect.py before.txt after.txt      # compare two drafts
+  python3 detect.py draft.txt --lang fa       # default: auto
 """
 
 import argparse
@@ -27,16 +33,17 @@ import os
 import re
 import statistics
 import sys
-import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEX = os.path.join(HERE, "slop.json")
+sys.path.insert(0, HERE)
+import fa_text  # noqa: E402
 
-SENT_RE = re.compile(r"[^.!?\n]+[.!?]*")
-WORD_RE = re.compile(r"[A-Za-z']+")
+SENT_RE = fa_text.SENT_RE
+WORD_RE = fa_text.letters_re("'")
 CONTRACTIONS = re.compile(r"\b\w+'(?:s|t|re|ve|ll|d|m)\b", re.IGNORECASE)
 PRONOUNS = re.compile(r"\b(i|me|my|mine|we|us|our|you|your)\b", re.IGNORECASE)
-NUMBERS = re.compile(r"\b\d[\d,.]*%?\b|\$\d")
+NUMBERS = re.compile(r"\b\d[\d,.٫٬]*[%٪]?\b|\$\d")
 PROPER = re.compile(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]{2,}\b", re.MULTILINE)
 
 
@@ -70,7 +77,7 @@ def check_burstiness(text):
     return score, f"variation {cv:.2f} across {len(lens)} sentences (want 0.55+)"
 
 
-def check_specificity(text):
+def check_specificity(text, lang="en"):
     """Numbers, names and concrete nouns. Slop is abstract."""
     w = words(text)
     if len(w) < 25:
@@ -79,11 +86,15 @@ def check_specificity(text):
     hits = len(NUMBERS.findall(text)) + len(set(PROPER.findall(text)))
     density = hits * per100
     score = scale(density, human=6.0, machine=0.5)
-    return score, f"{hits} concrete markers, {density:.1f} per 100 words (want 4+)"
+    # Names are found by their capital letter, and Persian has none.
+    note = ". Persian names are not counted yet" if lang == "fa" else ""
+    return score, f"{hits} concrete markers, {density:.1f} per 100 words (want 4+){note}"
 
 
-def check_slop(text, lex):
+def check_slop(text, lex, lang="en"):
     """Stock vocabulary density against the lexicon."""
+    if lang == "fa":
+        return None, "not scored: there is no Persian lexicon yet"
     w = words(text)
     if not w:
         return 50.0, "empty"
@@ -103,9 +114,11 @@ def check_slop(text, lex):
     return score, detail
 
 
-def check_fingerprint(text):
-    """Characters a phone keyboard does not produce."""
-    invisible = sum(1 for c in text if unicodedata.category(c) == "Cf")
+def check_fingerprint(text, lang="en"):
+    """Characters a phone keyboard does not produce. The Persian half-space,
+    the joiner inside an emoji and the direction marks in Persian text are
+    typed on purpose and do not count."""
+    invisible = fa_text.stray_invisibles(text, lang)
     em = text.count("—")
     curly = sum(text.count(c) for c in "‘’“”")
     ellip = text.count("…")
@@ -118,8 +131,10 @@ def check_fingerprint(text):
     return score, detail
 
 
-def check_voice(text, lex):
+def check_voice(text, lex, lang="en"):
     """Contractions, person, and the shapes models default to."""
+    if lang == "fa":
+        return None, "not scored: contractions and pronouns here are English measures"
     w = words(text)
     if len(w) < 25:
         return 50.0, "too short to judge"
@@ -154,14 +169,16 @@ def check_voice(text, lex):
 CHECKS = ["BURSTINESS", "SPECIFICITY", "SLOP DENSITY", "FINGERPRINT", "VOICE"]
 
 
-def run(text, lex):
+def run(text, lex, lang="auto"):
+    lang = fa_text.resolve_lang(lang, text)
     results = {}
     results["BURSTINESS"] = check_burstiness(text)
-    results["SPECIFICITY"] = check_specificity(text)
-    results["SLOP DENSITY"] = check_slop(text, lex)
-    results["FINGERPRINT"] = check_fingerprint(text)
-    results["VOICE"] = check_voice(text, lex)
-    scores = [results[c][0] for c in CHECKS]
+    results["SPECIFICITY"] = check_specificity(text, lang)
+    results["SLOP DENSITY"] = check_slop(text, lex, lang)
+    results["FINGERPRINT"] = check_fingerprint(text, lang)
+    results["VOICE"] = check_voice(text, lex, lang)
+    # A check that is not built for this language scores None and sits out.
+    scores = [results[c][0] for c in CHECKS if results[c][0] is not None]
     # The weakest check drags the verdict: a detector only needs one signal.
     overall = statistics.mean(scores) * 0.6 + min(scores) * 0.4
     verdict = "PASS" if overall >= 70 and min(scores) >= 55 else (
@@ -169,7 +186,13 @@ def run(text, lex):
     return results, overall, verdict
 
 
+def weakest_check(results):
+    return min((c for c in CHECKS if results[c][0] is not None), key=lambda c: results[c][0])
+
+
 def bar(score, width=24):
+    if score is None:
+        return " " * width
     filled = round(score / 100 * width)
     return "#" * filled + "." * (width - filled)
 
@@ -180,13 +203,16 @@ def render(results, overall, verdict, label=None, out=sys.stdout):
     print("=" * max(len(title), 62), file=out)
     for name in CHECKS:
         score, detail = results[name]
-        print(f"  {name:<13} {bar(score)} {score:5.1f}", file=out)
+        shown = "  n/a" if score is None else f"{score:5.1f}"
+        print(f"  {name:<13} {bar(score)} {shown}", file=out)
         print(f"  {'':<13} {detail}", file=out)
     print("-" * 62, file=out)
     print(f"  {'HUMAN SCORE':<13} {bar(overall)} {overall:5.1f}   {verdict}", file=out)
+    skipped = sum(1 for c in CHECKS if results[c][0] is None)
+    if skipped:
+        print(f"  {'':<13} over {len(CHECKS) - skipped} of {len(CHECKS)} checks", file=out)
     if verdict != "PASS":
-        weakest = min(CHECKS, key=lambda c: results[c][0])
-        print(f"\n  Weakest signal: {weakest}. Fix that first.", file=out)
+        print(f"\n  Weakest signal: {weakest_check(results)}. Fix that first.", file=out)
     print("", file=out)
 
 
@@ -196,10 +222,13 @@ def main():
     ap.add_argument("compare", nargs="?", help="second file, to show before/after")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--lexicon", default=LEX)
+    ap.add_argument("--lang", default="auto", choices=["auto", "fa", "en"],
+                    help="language of the draft (default: guess from the letters)")
     args = ap.parse_args()
 
+    fa_text.utf8_stdio()
     lex = json.load(open(args.lexicon, encoding="utf-8"))
-    read = lambda p: sys.stdin.read() if p == "-" else open(p, encoding="utf-8").read()
+    read = fa_text.read_input
 
     targets = [(args.input, read(args.input))]
     if args.compare:
@@ -207,10 +236,11 @@ def main():
 
     payload = []
     for name, text in targets:
-        results, overall, verdict = run(text, lex)
+        results, overall, verdict = run(text, lex, args.lang)
         payload.append({
             "source": name,
-            "checks": {k: {"score": round(v[0], 1), "detail": v[1]} for k, v in results.items()},
+            "checks": {k: {"score": None if v[0] is None else round(v[0], 1), "detail": v[1]}
+                       for k, v in results.items()},
             "human_score": round(overall, 1),
             "verdict": verdict,
         })
@@ -220,7 +250,7 @@ def main():
         return
 
     for (name, text), p in zip(targets, payload):
-        results, overall, verdict = run(text, lex)
+        results, overall, verdict = run(text, lex, args.lang)
         render(results, overall, verdict, label=os.path.basename(name) if args.compare else None)
     if args.compare:
         a, b = payload

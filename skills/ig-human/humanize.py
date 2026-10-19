@@ -2,16 +2,21 @@
 """
 humanize.py - strip the machine fingerprint out of a draft.
 
-Three passes, in this order:
+Four passes, in this order:
 
   1. INVISIBLE   delete or normalise the characters a human keyboard never
-                 produces: zero-width joiners, word joiners, soft hyphens,
+                 produces: zero-width spaces, word joiners, soft hyphens,
                  BOMs, Unicode tag characters, non-breaking and narrow spaces.
                  These survive copy-paste and are the most mechanical tell in
-                 any generated text.
-  2. TYPOGRAPHIC em dash -> comma, en dash -> hyphen, curly quotes -> straight,
-                 ellipsis -> three dots, bullet -> hyphen.
-  3. LEXICAL     replace the slop lexicon in slop.json with plain words,
+                 any generated text. Three are kept where they do a job: the
+                 Persian half-space between two letters, the joiner inside an
+                 emoji, and the direction marks in Persian text.
+  2. PERSIAN     Arabic yeh and kaf to Persian, and the half-space a phone
+                 keyboard leaves out ("می خواهم", "کتاب ها"). See fa_text.py.
+  3. TYPOGRAPHIC em dash -> comma (the Persian comma in Persian text), en dash
+                 -> hyphen, curly quotes -> straight, ellipsis -> three dots,
+                 bullet -> hyphen.
+  4. LEXICAL     replace the slop lexicon in slop.json with plain words,
                  preserving capitalisation and leaving URLs untouched.
 
 Structural tells (rule-of-three, "not just X, it's Y", hashtag walls) are
@@ -24,6 +29,7 @@ Usage
   pbpaste | python3 humanize.py - --report
   python3 humanize.py draft.txt --json
   python3 humanize.py draft.txt -o clean.txt
+  python3 humanize.py draft.txt --lang fa     # default: auto
 """
 
 import argparse
@@ -35,9 +41,11 @@ import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEX = os.path.join(HERE, "slop.json")
+sys.path.insert(0, HERE)
+import fa_text  # noqa: E402
 
 URL_RE = re.compile(r"https?://\S+|www\.\S+|\S+@\S+\.\S+")
-SENT_RE = re.compile(r"[^.!?\n]+[.!?]*")
+SENT_RE = fa_text.SENT_RE
 
 
 def load_lexicon(path=LEX):
@@ -70,11 +78,18 @@ def restore_urls(text, found):
     return text
 
 
-def pass_invisible(text, lex):
+def pass_invisible(text, lex, lang="en"):
     """Delete or space-normalise invisible characters. Returns (text, hits)."""
     hits = []
     for entry in lex["invisible"]:
         cp = _cp(entry["cp"])
+        if entry["action"] == "stray" and not isinstance(cp, tuple):
+            # Deleted only where it is not part of the spelling or an emoji.
+            text, n, kept = fa_text.drop_stray(text, {chr(cp)}, lang)
+            if n:
+                hits.append({"name": entry["cp"] + " " + entry["name"], "count": n,
+                             "action": "delete stray" + (f", kept {kept}" if kept else "")})
+            continue
         if isinstance(cp, tuple):
             pattern = "[" + re.escape(chr(cp[0])) + "-" + re.escape(chr(cp[1])) + "]"
         else:
@@ -84,16 +99,25 @@ def pass_invisible(text, lex):
             hits.append({"name": entry["cp"] + " " + entry["name"], "count": n,
                          "action": entry["action"]})
             text = re.sub(pattern, "" if entry["action"] == "delete" else " ", text)
-    # Any remaining Cf (format) character is invisible by definition.
-    stray = [c for c in text if unicodedata.category(c) == "Cf"]
+    # Any remaining Cf (format) character is invisible by definition, except
+    # the ones the 'stray' entries above decided to keep.
+    keep = {i for i, c in enumerate(text) if unicodedata.category(c) == "Cf"
+            and fa_text.is_legit_invisible(text, i, lang)}
+    stray = [i for i, c in enumerate(text) if unicodedata.category(c) == "Cf" and i not in keep]
     if stray:
         hits.append({"name": "other invisible format chars", "count": len(stray),
                      "action": "delete"})
-        text = "".join(c for c in text if unicodedata.category(c) != "Cf")
+        drop = set(stray)
+        text = "".join(c for i, c in enumerate(text) if i not in drop)
     return text, hits
 
 
-def pass_typographic(text, lex):
+def pass_persian(text):
+    """Persian orthography: see fa_text.fix_orthography. Returns (text, hits)."""
+    return fa_text.fix_orthography(text)
+
+
+def pass_typographic(text, lex, lang="en"):
     hits = []
     for entry in lex["typographic"]:
         ch = entry["from"]
@@ -101,18 +125,20 @@ def pass_typographic(text, lex):
         if not n:
             continue
         hits.append({"name": f"{ch} {entry['name']}", "count": n, "to": entry["to"].strip() or "(space)"})
+        # Persian text takes the Persian comma, not the Latin one.
+        comma = "، " if lang == "fa" else ", "
         if ch == "—":
             # " word — word " and "word—word" both collapse to a comma + space.
-            text = re.sub(r"\s*—\s*", ", ", text)
+            text = re.sub(r"\s*—\s*", comma, text)
         elif ch == "–":
             text = re.sub(r"\s*–\s*(?=\d)", "-", text)      # 5–10  -> 5-10
-            text = re.sub(r"\s+–\s+", ", ", text)            # used as em dash
+            text = re.sub(r"\s+–\s+", comma, text)           # used as em dash
             text = text.replace("–", "-")
         else:
             text = text.replace(ch, entry["to"])
     # A comma inserted before existing punctuation reads wrong.
-    text = re.sub(r",\s*([,.;:!?])", r"\1", text)
-    text = re.sub(r",\s*\n", "\n", text)
+    text = re.sub(r"[,،]\s*([,،.;؛:!?؟])", r"\1", text)
+    text = re.sub(r"[,،]\s*\n", "\n", text)
     return text, hits
 
 
@@ -145,15 +171,15 @@ def pass_lexical(text, lex):
     # punctuation behind ("system. ." or a line that now opens on a comma),
     # and that reads worse than the slop did.
     text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"(?m)^[ \t]*(?:[,.;:]+[ \t]*)+", "", text)
+    text = re.sub(r"(?m)^[ \t]*(?:[,.;:،؛]+[ \t]*)+", "", text)
     text = re.sub(r"(?m)^[ \t](?=\S)", "", text)       # one space left by a deletion.
                                                       # Deeper indents are deliberate.
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    text = re.sub(r",\s*([,.;:!?])", r"\1", text)      # an em dash became a comma,
+    text = re.sub(r"\s+([,.;:!?،؛؟])", r"\1", text)
+    text = re.sub(r"[,،]\s*([,.;:!?،؛؟])", r"\1", text)  # an em dash became a comma,
                                                       # then the clause after it went
     text = text.replace("...", "\x00ELL\x00")          # protect real ellipses
     text = re.sub(r"\.\s*\.+", ".", text)
-    text = re.sub(r"([!?])\s*\.", r"\1", text)
+    text = re.sub(r"([!?؟])\s*\.", r"\1", text)
     text = text.replace("\x00ELL\x00", "...")
     text = re.sub(r"(?m)^[ \t]+$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -203,16 +229,19 @@ def restore_capitals(original, text):
                   lambda m: m.group(0)[:-1] + m.group(1).upper(), text)
 
 
-def humanize(text, lex):
+def humanize(text, lex, lang="auto"):
+    lang = fa_text.resolve_lang(lang, text)
     raw_for_case = text
     text, urls = protect_urls(text)
-    text, inv = pass_invisible(text, lex)
-    text, typo = pass_typographic(text, lex)
+    text, inv = pass_invisible(text, lex, lang)
+    text, fa = pass_persian(text)
+    text, typo = pass_typographic(text, lex, lang)
     text, lexi = pass_lexical(text, lex)
     text = restore_capitals(raw_for_case, text)
     text = restore_urls(text, urls)
     return text.strip() + "\n", {
         "invisible": inv,
+        "persian": fa,
         "typographic": typo,
         "lexical": lexi,
         "structures": scan_structures(text, lex),
@@ -230,21 +259,27 @@ def render_report(report, out=sys.stderr):
     head("HUMANIZE REPORT")
     print(f"{total} machine artefacts removed, "
           f"{len(report['structures'])} structural tells flagged for rewrite", file=out)
+    if report["persian"]:
+        print(f"{sum(h['count'] for h in report['persian'])} Persian spelling fixes", file=out)
 
     if report["invisible"]:
         head("1. INVISIBLE CHARACTERS")
         for h in report["invisible"]:
             print(f"  {h['count']:>3}x  {h['name']}  -> {h['action']}", file=out)
+    if report["persian"]:
+        head("2. PERSIAN SPELLING")
+        for h in report["persian"]:
+            print(f"  {h['count']:>3}x  {h['name']}", file=out)
     if report["typographic"]:
-        head("2. TYPOGRAPHY")
+        head("3. TYPOGRAPHY")
         for h in report["typographic"]:
             print(f"  {h['count']:>3}x  {h['name']}  -> {h['to']}", file=out)
     if report["lexical"]:
-        head("3. SLOP LEXICON")
+        head("4. SLOP LEXICON")
         for h in report["lexical"]:
             print(f"  {h['count']:>3}x  {h['find']}  -> {h['replace']}   [{h['family']}]", file=out)
     if report["structures"]:
-        head("4. STRUCTURAL TELLS  (not auto-fixed - rewrite these yourself)")
+        head("5. STRUCTURAL TELLS  (not auto-fixed - rewrite these yourself)")
         for h in report["structures"]:
             print(f"  {h['count']:>3}x  {h['name']}\n        {h['fix']}", file=out)
     if not any(report.values()):
@@ -260,11 +295,14 @@ def main():
     ap.add_argument("--report", action="store_true", help="print what changed, to stderr")
     ap.add_argument("--json", action="store_true", help="emit {text, report} as JSON")
     ap.add_argument("--lexicon", default=LEX, help="path to slop.json")
+    ap.add_argument("--lang", default="auto", choices=["auto", "fa", "en"],
+                    help="language of the draft (default: guess from the letters)")
     args = ap.parse_args()
 
-    raw = sys.stdin.read() if args.input == "-" else open(args.input, encoding="utf-8").read()
+    fa_text.utf8_stdio()
+    raw = fa_text.read_input(args.input)
     lex = load_lexicon(args.lexicon)
-    clean, report = humanize(raw, lex)
+    clean, report = humanize(raw, lex, args.lang)
 
     if args.json:
         print(json.dumps({"text": clean, "report": report}, indent=2, ensure_ascii=False))
